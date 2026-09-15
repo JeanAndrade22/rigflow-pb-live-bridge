@@ -38,6 +38,68 @@ async function persist(flights){const now=new Date().toISOString();const rows=fl
  await supabase.from('pb_sync_status').upsert({id:1,status:'live',last_attempt:now,last_success:now,row_count:rows.length,error:null,updated_at:now});
 }
 async function setError(err){const now=new Date().toISOString();const {data}=await supabase.from('pb_sync_status').select('last_success').eq('id',1).maybeSingle();const status=data?.last_success?'stale':'error';await supabase.from('pb_sync_status').upsert({id:1,status,last_attempt:now,error:String(err?.message||err),updated_at:now});memory.status=status;memory.error=String(err?.message||err);}
-async function capture(){memory.lastAttempt=new Date().toISOString();try{await ensureBrowser();await page.goto(PB_URL,{waitUntil:'domcontentloaded',timeout:50000});await page.waitForTimeout(5000);let flights=await extract();if(!flights.length){const b=page.getByRole('button',{name:/filtrar/i}).first();if(await b.count()){try{await b.click({timeout:5000});await page.waitForTimeout(3000)}catch{}flights=await extract()}}if(!flights.length)throw new Error('Nenhuma linha de voo encontrada no painel PB renderizado.');await persist(flights);memory={status:'live',lastAttempt:memory.lastAttempt,lastSuccess:new Date().toISOString(),count:flights.length,error:null};console.log(`[PB] ${flights.length} voos capturados`);}catch(e){console.error('[PB]',e);await setError(e)}}
-app.get('/health',(_,res)=>res.json(memory));app.post('/refresh',async(_,res)=>{await capture();res.json(memory)});app.listen(PORT,()=>console.log(`RIGFLOW PB Collector :${PORT} polling ${POLL_MS}ms`));
+async function capture() {
+  memory.lastAttempt = new Date().toISOString();
+
+  try {
+    await ensureBrowser();
+
+    await page.goto(PB_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    await page.waitForLoadState("networkidle", {
+      timeout: 60000
+    }).catch(() => {});
+
+    await page.waitForTimeout(5000);
+
+    await page.waitForFunction(() => {
+      const body = document.body?.innerText || "";
+
+      return (
+        body.includes("Painel de voos") ||
+        body.includes("Horário") ||
+        body.includes("Destino") ||
+        body.includes("Cia Aérea")
+      );
+    }, {
+      timeout: 30000
+    }).catch(() => {});
+
+    const flights = await extract();
+
+    if (!flights.length) {
+      throw new Error(
+        "Nenhuma linha de voo encontrada no painel PB renderizado."
+      );
+    }
+
+    await persist(flights);
+
+    memory = {
+      status: "live",
+      lastAttempt: new Date().toISOString(),
+      lastSuccess: new Date().toISOString(),
+      count: flights.length,
+      error: null
+    };
+
+    console.log(`[PB] OK: ${flights.length} voos capturados`);
+
+  } catch (err) {
+
+    console.error("[PB] Error:", err?.message || err);
+
+    memory = {
+      ...memory,
+      status: memory.lastSuccess ? "stale" : "error",
+      lastAttempt: new Date().toISOString(),
+      error: err?.message || String(err)
+    };
+
+    await setError(err);
+  }
+}app.get('/health',(_,res)=>res.json(memory));app.post('/refresh',async(_,res)=>{await capture();res.json(memory)});app.listen(PORT,()=>console.log(`RIGFLOW PB Collector :${PORT} polling ${POLL_MS}ms`));
 await capture();setInterval(capture,POLL_MS);
