@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: rigflow-pb-collector
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: POLL_MS
+        value: 30000
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
