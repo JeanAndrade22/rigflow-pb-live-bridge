@@ -21,7 +21,7 @@ const app = express();
 let browser;
 let running = false;
 let memory = {
-  version: '7.0.0',
+  version: '8.0.0',
   status: 'starting',
   source: 'PB visible panel only',
   lastAttempt: null,
@@ -154,6 +154,48 @@ async function ensureBrowser() {
   });
 }
 
+function rowQuality(row) {
+  if (!row) return -1;
+  let score = 0;
+  const weighted = [
+    ['date_time', 4], ['airport', 3], ['destination', 4], ['company', 2],
+    ['aircraft_model', 2], ['status', 5], ['remarks', 2], ['registration', 3],
+    ['actual', 1], ['return_forecast', 1],
+  ];
+  for (const [k, w] of weighted) if (clean(row[k])) score += w;
+  // Real operational states are especially valuable and should beat sparse duplicates.
+  if (/transfer|atras|check|acion|decol|pous|cancel|corte|embar/i.test(norm(row.status))) score += 3;
+  return score;
+}
+
+function mergeRow(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const best = rowQuality(incoming) >= rowQuality(existing) ? { ...existing, ...incoming } : { ...incoming, ...existing };
+  // Never replace a useful value with blank text from a poorer duplicate DOM representation.
+  for (const k of ['date_time','airport','destination','company','aircraft_model','status','remarks','registration','actual','return_forecast']) {
+    if (!clean(best[k])) best[k] = clean(incoming[k]) || clean(existing[k]) || '';
+  }
+  best.source_key = existing.source_key || incoming.source_key;
+  best.flight = existing.flight || incoming.flight;
+  best.raw = {
+    ...(existing.raw || {}), ...(incoming.raw || {}),
+    flight: best.flight,
+    company: best.company,
+    aircraft_model: best.aircraft_model,
+    status: best.status,
+    remarks: best.remarks,
+    registration: best.registration,
+    airport: best.airport,
+    destination: best.destination,
+    date_time: best.date_time,
+    actual: best.actual,
+    return_forecast: best.return_forecast,
+    source: 'PB visible panel',
+  };
+  return best;
+}
+
 async function collectRenderedRows(page) {
   await page.waitForFunction(() => {
     const text = document.body?.innerText || '';
@@ -196,15 +238,15 @@ async function collectRenderedRows(page) {
         }
       }
 
-      // Generic row fallback for OutSystems layouts that do not expose table semantics.
-      if (!out.length) {
-        const nodes = [...document.querySelectorAll('div, li')];
-        for (const el of nodes) {
-          const txt = (el.innerText || '').trim();
-          if (!/\b\d{7,12}\b/.test(txt)) continue;
-          const children = [...el.children].map((c) => (c.innerText || '').trim()).filter(Boolean);
-          if (children.length >= 4 && children.length <= 16) pushRow([], children);
-        }
+      // Generic OutSystems fallback: always inspect compact containers containing a flight number.
+      // This catches exceptional rows (Transferred/Cancelled/Delayed) that may be rendered outside the main table body.
+      const nodes = [...document.querySelectorAll('div, li, section, article')];
+      for (const el of nodes) {
+        const txt = (el.innerText || '').trim();
+        if (!/\b\d{7,12}\b/.test(txt)) continue;
+        if (txt.length > 1800) continue;
+        const children = [...el.children].map((c) => (c.innerText || '').trim()).filter(Boolean);
+        if (children.length >= 4 && children.length <= 20) pushRow([], children);
       }
       return out;
     });
@@ -212,7 +254,7 @@ async function collectRenderedRows(page) {
     const before = collected.size;
     for (const block of blocks) {
       const row = mapRow(block.cells, block.headers || []);
-      if (row) collected.set(row.flight, row);
+      if (row) collected.set(row.flight, mergeRow(collected.get(row.flight), row));
     }
     const added = collected.size - before;
     blockNo += 1;
@@ -345,42 +387,39 @@ async function persist(flights) {
   if (!flights.length) throw new Error('Zero visible flights; previous snapshot preserved');
   const now = new Date().toISOString();
 
-  // Match the existing pb_flights schema. No updated_at column is used.
-  const rows = flights.map((f) => ({
-    ...f,
-    active: true,
-    last_seen_at: now,
-  }));
+  // Fetch current versions so blank/sparse visual rows never erase richer data captured earlier.
+  const keys = flights.map((f) => f.source_key);
+  const existingByKey = new Map();
+  for (let i = 0; i < keys.length; i += 100) {
+    const chunk = keys.slice(i, i + 100);
+    const { data, error } = await supabase.from('pb_flights').select('*').in('source_key', chunk);
+    if (error) throw error;
+    for (const row of data || []) existingByKey.set(row.source_key, row);
+  }
+
+  const rows = flights.map((f) => {
+    const old = existingByKey.get(f.source_key) || {};
+    const merged = { ...old, ...f };
+    for (const k of ['date_time','airport','destination','company','aircraft_model','status','remarks','registration','actual','return_forecast']) {
+      if (!clean(f[k]) && clean(old[k])) merged[k] = old[k];
+    }
+    merged.active = true;
+    merged.last_seen_at = now;
+    merged.source_key = f.source_key;
+    merged.flight = f.flight;
+    merged.raw = { ...(old.raw || {}), ...(f.raw || {}), captured_at: now };
+    // Do not send DB-generated/id fields back unless required.
+    delete merged.id;
+    return merged;
+  });
 
   const result = await adaptiveUpsert('pb_flights', rows, { onConflict: 'source_key' });
   if (result.removed.length) console.warn('[PB VISIBLE] Ignored unavailable pb_flights columns:', result.removed.join(', '));
 
-  // Deactivate only flights from today's visible schedule that were not seen in a healthy capture.
-  // Older/future transferred flights are preserved and can be updated when they reappear.
-  if (rows.length >= 10) {
-    const { day, month, year } = brazilDateParts();
-    const todayPrefix = `${day}/${month}/${year}`;
-    const visibleKeys = new Set(rows.map((r) => r.source_key));
+  // IMPORTANT: visual/virtualized lists can temporarily omit rows. V8 never deactivates a flight
+  // simply because it was absent from one visual scan. This prevents transferred/delayed/cancelled
+  // flights from disappearing from RIGFLOW. Frontend date/status filters decide what is shown.
 
-    const { data: activeToday, error: selectError } = await supabase
-      .from('pb_flights')
-      .select('source_key,date_time')
-      .eq('active', true)
-      .like('date_time', `${todayPrefix}%`);
-
-    if (!selectError && Array.isArray(activeToday)) {
-      const missing = activeToday.filter((r) => !visibleKeys.has(r.source_key)).map((r) => r.source_key);
-      if (missing.length) {
-        const { error: deactivateError } = await supabase
-          .from('pb_flights')
-          .update({ active: false, last_seen_at: now })
-          .in('source_key', missing);
-        if (deactivateError) console.warn('[PB VISIBLE] Could not deactivate missing rows:', deactivateError.message);
-      }
-    }
-  }
-
-  // Keep sync status updated, but adapt automatically if its schema differs.
   const syncPayload = {
     id: 1,
     status: 'live',
@@ -455,8 +494,21 @@ app.get('/debug/visible', async (_req, res) => {
   }
 });
 
+app.get('/debug/flight/:flight', async (req, res) => {
+  try {
+    const wanted = clean(req.params.flight);
+    const flights = await readVisiblePanel();
+    const visible = flights.find((f) => f.flight === wanted) || null;
+    const { data: stored, error } = await supabase.from('pb_flights').select('*').eq('flight', wanted).order('last_seen_at', { ascending: false }).limit(5);
+    if (error) throw error;
+    res.json({ flight: wanted, visible, stored: stored || [] });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB Visual Collector v7 :${PORT} polling ${POLL_MS}ms`);
+  console.log(`RIGFLOW PB Visual Collector v8 :${PORT} polling ${POLL_MS}ms`);
   console.log('Scope: reads only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 
