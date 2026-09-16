@@ -21,7 +21,7 @@ const app = express();
 let browser;
 let running = false;
 let memory = {
-  version: '9.0.0',
+  version: '10.0.0',
   status: 'starting',
   source: 'PB visible panel only',
   lastAttempt: null,
@@ -68,6 +68,73 @@ function findHeaderIndex(headers, patterns) {
   return headers.findIndex((h) => patterns.some((p) => h.includes(p)));
 }
 
+
+function looksLikeAircraftModel(value) {
+  const s = clean(value).toUpperCase();
+  return /^(?:AW[- ]?\d{3}|H\d{3}|S[- ]?92A?|ATR[- ]?\d{2,3}(?:[- ]?\d{3})?|EC\d{3}|AS\d{3}|B\d{3}|BELL[- ]?\d{3}|SK\d{2,3})$/.test(s);
+}
+
+function looksLikeRegistration(value) {
+  const s = clean(value).toUpperCase();
+  return /^(?:P[PRSTU]|PT|PS|PP|PR|PU)-?[A-Z0-9]{3,5}$/.test(s);
+}
+
+function looksLikeStatus(value) {
+  const s = norm(value);
+  return [
+    'previsto','transferido','atrasado','cancelado','cancelada','decolagem','decolado','pousado',
+    'check-in aberto','check in aberto','check-in concluido','check in concluido','embarque','acionamento',
+    'em voo','concluido','fechado'
+  ].some((x) => s.includes(x));
+}
+
+function inferCompany(cells, model, registration, status) {
+  const known = [
+    'omni','chc','lider','lider aviacao','bristow','aeroleo','aeróleo','azul linhas aereas','azul linhas aéreas',
+    'saint','aerorio','helicidade','embraer'
+  ];
+  const excluded = new Set([clean(model), clean(registration), clean(status)]);
+  for (const c of cells.map(clean)) {
+    if (!c || excluded.has(c)) continue;
+    const n = norm(c);
+    if (known.some((k) => n === norm(k) || n.includes(norm(k)))) return c;
+  }
+  return '';
+}
+
+function normalizeIdentityFields(row, cells = []) {
+  let company = clean(row.company);
+  let model = clean(row.aircraft_model);
+  let registration = clean(row.registration);
+  let status = clean(row.status);
+
+  // Recover fields from generic/virtualized DOM blocks when the positional fallback is shifted.
+  if (!model || !looksLikeAircraftModel(model)) {
+    const hit = cells.map(clean).find(looksLikeAircraftModel);
+    if (hit) model = hit;
+  }
+  if (!registration || !looksLikeRegistration(registration)) {
+    const hit = cells.map(clean).find(looksLikeRegistration);
+    if (hit) registration = hit;
+  }
+  if (!status || !looksLikeStatus(status)) {
+    const hit = cells.map(clean).find(looksLikeStatus);
+    if (hit) status = hit;
+  }
+
+  // A common virtual-grid failure was company=H175 while aircraft_model=H175.
+  // Never allow an aircraft model or registration to overwrite the operator/company.
+  if (looksLikeAircraftModel(company) || looksLikeRegistration(company) || looksLikeStatus(company)) company = '';
+  if (!company) company = inferCompany(cells, model, registration, status);
+
+  // If the model column accidentally captured an operator and company captured a model, swap safely.
+  if (looksLikeAircraftModel(company) && !looksLikeAircraftModel(model)) {
+    const tmp = model; model = company; company = tmp;
+  }
+
+  return { ...row, company, aircraft_model: model, registration, status };
+}
+
 function mapRow(cells, headers) {
   if (!Array.isArray(cells) || cells.length < 4) return null;
   const hs = headers.map(norm);
@@ -112,7 +179,7 @@ function mapRow(cells, headers) {
     return i >= 0 && i < cells.length ? clean(cells[i]) : '';
   };
 
-  const row = {
+  let row = {
     source_key: stableKey(flight),
     date_time: normalizeDateTime(at('time')),
     airport: at('airport'),
@@ -126,6 +193,8 @@ function mapRow(cells, headers) {
     actual: at('actual'),
     return_forecast: at('returnForecast'),
   };
+
+  row = normalizeIdentityFields(row, cells);
 
   row.raw = {
     flight: row.flight,
@@ -471,9 +540,14 @@ async function persist(flights) {
     const base = { ...richestOld, ...(canonicalOld || {}) };
 
     // Prefer the current visible state, but do not let a sparse DOM row erase richer metadata.
-    const merged = { ...base, ...f };
+    const incoming = normalizeIdentityFields({ ...f }, []);
+    const merged = { ...base, ...incoming };
     for (const k of ['date_time','airport','destination','company','aircraft_model','status','remarks','registration','actual','return_forecast']) {
-      if (!clean(f[k]) && clean(base[k])) merged[k] = base[k];
+      if (!clean(incoming[k]) && clean(base[k])) merged[k] = base[k];
+    }
+    // Last guardrail: a model-shaped value can never replace a known operator/company.
+    if (looksLikeAircraftModel(merged.company) && clean(base.company) && !looksLikeAircraftModel(base.company)) {
+      merged.company = base.company;
     }
 
     const history = buildHistory(previous, merged);
@@ -627,7 +701,7 @@ app.get('/debug/flight/:flight', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB Visual Collector v9 :${PORT} polling ${POLL_MS}ms`);
+  console.log(`RIGFLOW PB Visual Collector v10 :${PORT} polling ${POLL_MS}ms`);
   console.log('Scope: reads only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 

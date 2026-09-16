@@ -1,8 +1,8 @@
-# RIGFLOW PB Visual Collector v9
+# RIGFLOW PB Visual Collector v10
 
 This version keeps the visual-only collection approach and fixes logical-flight consolidation.
 
-## What V9 changes
+## What V10 changes
 - One canonical `pb_flights` row per flight number (`source_key = SHA256("PB|<flight>")`).
 - Existing duplicate rows for a visible flight are merged only after the canonical row is successfully written.
 - Historical schedule/status snapshots are preserved in `raw.history` before duplicates are deleted.
@@ -30,3 +30,6 @@ Expected after the first successful sync:
 - `current_schedule: 17/09/2026 06:48:00` (if still shown by PB),
 - `reprogrammed: true`,
 - timeline/history containing the preserved schedule snapshots.
+
+
+V10: corrected company/operator vs aircraft-model mapping for generic/virtualized PB rows. Model-shaped values such as H175/AW139/S-92A are never allowed to overwrite company. Existing richer company values are preserved.
