@@ -2,12 +2,10 @@ import express from 'express';
 import crypto from 'node:crypto';
 import { chromium } from 'playwright';
 import { createClient } from '@supabase/supabase-js';
-import { XMLParser } from 'fast-xml-parser';
 
 const PORT = Number(process.env.PORT || 8787);
 const POLL_MS = Number(process.env.POLL_MS || 30000);
 const PB_URL = process.env.PB_URL || 'https://transporteaereo.petrobras.com.br/A18040_App/Generic?PageUrl=paineldevoos&MenuName=Painel%20de%20voos';
-const PB_API_URL = process.env.PB_API_URL || 'https://transporteaereo.petrobras.com.br/A18040_App/screenservices/A18040_App_Backoffice_CW/PainelDeVoos/PainelDeVoos/ScreenDataSetGetVoosAeroportoCache';
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
@@ -19,239 +17,226 @@ const supabase = createClient(
   { auth: { persistSession: false } },
 );
 
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: '@_',
-  parseTagValue: false,
-  trimValues: true,
-  removeNSPrefix: true,
-});
-
 const app = express();
 let browser;
-let context;
-let page;
 let running = false;
 let memory = {
   status: 'starting',
-  source: 'PB OutSystems direct API',
+  source: 'PB visible panel only',
   lastAttempt: null,
   lastSuccess: null,
   count: 0,
   error: null,
-  apiResponseSeenAt: null,
-  mode: null,
 };
 
 const clean = (v = '') => String(v ?? '').replace(/\s+/g, ' ').trim();
-const asArray = (v) => v == null ? [] : Array.isArray(v) ? v : [v];
+const norm = (v = '') => clean(v).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const stableKey = (flight) => crypto.createHash('sha256').update(`PB|${clean(flight)}`).digest('hex');
 
-const PB_REQUEST_BODY = {
-  versionInfo: {
-    moduleVersion: '7R+xzrKM_eeJewXnr4WYCQ',
-    apiVersion: 'ixZokngowh2BmEzh0JPecg',
-  },
-  viewName: 'PageGeneric.Generic',
-  screenData: {
-    variables: {
-      IsPartida: true,
-      StartIndex: 0,
-      TableSort: '',
-      VoosAeroportoDTO_New: {
-        List: [],
-        EmptyListItem: {
-          Codigo: '0', CodigoEmpresa: '', NomeEmpresa: '', NumeroVoo: '0',
-          PrefixoAeronave: '', ModeloAeronave: '', Rota: '', Observacao: '',
-          StatusVoo: '', HorarioOriginal: '1900-01-01T00:00:00',
-          PrevisaoDecolagem: '1900-01-01T00:00:00', PrevisaoRetorno: '1900-01-01T00:00:00',
-          SiglaAeroporto: '', NomeAeroporto: '', CompanyImg: null, NomeAeroportoAmigavel: '',
-        },
-      },
-      DropdownItems: {
-        VooList: { List: [], EmptyListItem: { NumeroVoo: '' } },
-        AeroportoList: { List: [], EmptyListItem: { SiglaAeroporto: '', NomeAeroporto: '' } },
-        CiaList: { List: [], EmptyListItem: { NomeEmpresa: '' } },
-        DestinoList: { List: [], EmptyListItem: { Rota: '' } },
-      },
-      VoosAeroportoDTO_New_Copy: {
-        List: [],
-        EmptyListItem: {
-          Codigo: '0', CodigoEmpresa: '', NomeEmpresa: '', NumeroVoo: '0',
-          PrefixoAeronave: '', ModeloAeronave: '', Rota: '', Observacao: '',
-          StatusVoo: '', HorarioOriginal: '1900-01-01T00:00:00',
-          PrevisaoDecolagem: '1900-01-01T00:00:00', PrevisaoRetorno: '1900-01-01T00:00:00',
-          SiglaAeroporto: '', NomeAeroporto: '', CompanyImg: null, NomeAeroportoAmigavel: '',
-        },
-      },
-      DropdownFilters: {
-        AeroportoList: { List: [], EmptyListItem: { SiglaAeroporto: '', NomeAeroporto: '' } },
-        Destino: { Rota: '' },
-        Voo: { NumeroVoo: '' },
-        Cia: { NomeEmpresa: '' },
-      },
-      TimerId: 0,
-      Progress: 0,
-    },
-  },
-  inputParameters: {},
-  clientVariables: {
-    user_token: '', user_tokenexpires: '', user_cpf: '', user_email: '', user_chave: '',
-  },
-};
+function brazilDatePrefix() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
 
-function normalizeDate(value) {
+function normalizeDateTime(value) {
   const s = clean(value);
-  return s || '';
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) return s;
+  let m = s.match(/(\d{2})\/(\d{2})\/(\d{4}).*?(\d{2}):(\d{2})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}T${m[4]}:${m[5]}:00`;
+  m = s.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (m) return `${brazilDatePrefix()}T${String(m[1]).padStart(2, '0')}:${m[2]}:00`;
+  return s;
 }
 
-function getCacheXmls(payload) {
-  const list = payload?.data?.List?.List;
-  return asArray(list)
-    .map((item) => item?.VoosAeroporto_Cache?.XML)
-    .filter(Boolean);
+function findHeaderIndex(headers, patterns) {
+  return headers.findIndex((h) => patterns.some((p) => h.includes(p)));
 }
 
-function extractDtos(parsed) {
-  const env = parsed?.Envelope ?? parsed?.['soap:Envelope'];
-  const body = env?.Body ?? env?.['soap:Body'];
-  const response = body?.GetPainelAeroportoListResponse;
-  const result = response?.GetPainelAeroportoListResult;
-  const collection = result?.VoosAeroportoCollection;
-  return asArray(collection?.VoosAeroportoDTO);
-}
+function mapRow(cells, headers) {
+  if (!Array.isArray(cells) || cells.length < 5) return null;
+  const hs = headers.map(norm);
 
-function mapDto(dto) {
-  const flight = clean(dto.NumeroVoo);
-  if (!flight) return null;
-  const prefix = clean(dto.PrefixoAeronave);
-  const remarks = clean(dto.Observacao);
+  const idx = {
+    time: findHeaderIndex(hs, ['horario', 'previsao', 'decolagem']),
+    airport: findHeaderIndex(hs, ['aeroporto', 'origem']),
+    destination: findHeaderIndex(hs, ['destino', 'rota']),
+    flight: findHeaderIndex(hs, ['voo']),
+    company: findHeaderIndex(hs, ['cia', 'empresa']),
+    model: findHeaderIndex(hs, ['mod. aeronave', 'modelo', 'aeronave']),
+    status: findHeaderIndex(hs, ['status']),
+    remarks: findHeaderIndex(hs, ['observacao', 'obs']),
+    prefix: findHeaderIndex(hs, ['prefixo', 'matricula']),
+  };
+
+  // Fallback to the visual order used by the PB panel when headers cannot be read.
+  const flightGuess = cells.findIndex((c) => /^\d{7,12}$/.test(clean(c)));
+  const flightIdx = idx.flight >= 0 ? idx.flight : flightGuess;
+  if (flightIdx < 0) return null;
+
+  const flight = clean(cells[flightIdx]);
+  if (!/^\d{7,12}$/.test(flight)) return null;
+
+  const fallback = {
+    time: 0,
+    airport: 1,
+    destination: 2,
+    flight: flightIdx,
+    company: flightIdx + 1,
+    model: flightIdx + 2,
+    status: flightIdx + 3,
+    remarks: flightIdx + 4,
+  };
+
+  const at = (name) => {
+    const i = idx[name] >= 0 ? idx[name] : fallback[name];
+    return i >= 0 && i < cells.length ? clean(cells[i]) : '';
+  };
+
+  const prefix = at('prefix');
+  const remarks = at('remarks');
   return {
     source_key: stableKey(flight),
-    date_time: normalizeDate(dto.PrevisaoDecolagem || dto.HorarioOriginal),
-    airport: clean(dto.NomeAeroporto || dto.SiglaAeroporto),
-    destination: clean(dto.Rota),
+    date_time: normalizeDateTime(at('time')),
+    airport: at('airport'),
+    destination: at('destination'),
     flight,
-    company: clean(dto.NomeEmpresa),
-    aircraft_model: clean(dto.ModeloAeronave),
-    status: clean(dto.StatusVoo),
+    company: at('company'),
+    aircraft_model: at('model'),
+    status: at('status'),
     remarks: [prefix ? `PREFIXO ${prefix}` : '', remarks].filter(Boolean).join(' · '),
   };
 }
 
-function parsePbPayload(payload) {
-  const xmls = getCacheXmls(payload);
-  if (!xmls.length) throw new Error('PB API response did not contain VoosAeroporto_Cache.XML');
-
-  const rows = [];
-  for (const xml of xmls) {
-    const parsed = xmlParser.parse(xml);
-    for (const dto of extractDtos(parsed)) {
-      const row = mapDto(dto);
-      if (row) rows.push(row);
-    }
-  }
-
-  const byFlight = new Map();
-  for (const row of rows) byFlight.set(row.flight, row);
-  return [...byFlight.values()].sort((a, b) => String(a.date_time).localeCompare(String(b.date_time)));
-}
-
-async function directPbRequest() {
-  const response = await fetch(PB_API_URL, {
-    method: 'POST',
-    headers: {
-      'accept': 'application/json, text/plain, */*',
-      'content-type': 'application/json; charset=UTF-8',
-      'referer': PB_URL,
-      'origin': 'https://transporteaereo.petrobras.com.br',
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36',
-    },
-    body: JSON.stringify(PB_REQUEST_BODY),
-    redirect: 'follow',
-    signal: AbortSignal.timeout(20000),
-  });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`PB direct API HTTP ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  let payload;
-  try { payload = JSON.parse(text); }
-  catch { throw new Error(`PB direct API returned non-JSON: ${text.slice(0, 300)}`); }
-
-  if (payload?.versionInfo?.hasModuleVersionChanged || payload?.versionInfo?.hasApiVersionChanged) {
-    throw new Error('PB OutSystems module/API version changed; collector payload needs refresh');
-  }
-
-  if (!getCacheXmls(payload).length) {
-    throw new Error('PB direct API returned JSON but no VoosAeroporto_Cache.XML');
-  }
-
-  memory.mode = 'direct';
-  return payload;
-}
-
 async function ensureBrowser() {
-  if (browser?.isConnected() && page && !page.isClosed()) return;
+  if (browser?.isConnected()) return;
   try { await browser?.close(); } catch {}
-  browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
-  context = await browser.newContext({ serviceWorkers: 'block', locale: 'pt-BR', timezoneId: 'America/Sao_Paulo' });
-  page = await context.newPage();
-}
-
-async function browserFallback() {
-  await ensureBrowser();
-  let found;
-  const responsePromise = new Promise((resolve) => {
-    const handler = async (response) => {
-      if (!/ScreenDataSetGetVoosAeroporto/i.test(response.url())) return;
-      try {
-        const payload = await response.json();
-        if (!getCacheXmls(payload).length) return;
-        found = payload;
-        page.off('response', handler);
-        resolve(payload);
-      } catch {}
-    };
-    page.on('response', handler);
+  browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage'],
   });
-  await page.goto(PB_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  const payload = await Promise.race([responsePromise, page.waitForTimeout(15000).then(() => null)]);
-  if (!payload && !found) throw new Error('Browser fallback did not capture PB XHR within 15s');
-  memory.mode = 'browser-fallback';
-  return payload || found;
 }
 
-async function getPbApiSnapshot() {
-  try {
-    return await directPbRequest();
-  } catch (directError) {
-    console.warn('[PB API] Direct request failed:', directError?.message || directError);
-    try {
-      return await browserFallback();
-    } catch (browserError) {
-      throw new Error(`Direct: ${directError?.message || directError} | Fallback: ${browserError?.message || browserError}`);
+async function collectRenderedRows(page) {
+  // Wait for the visible PB panel and at least one plausible flight row.
+  await page.waitForFunction(() => {
+    const text = document.body?.innerText || '';
+    return /painel de voos/i.test(text) || /cia a[eé]rea/i.test(text) || /mod\. aeronave/i.test(text);
+  }, { timeout: 45000 }).catch(() => {});
+
+  const collected = new Map();
+
+  async function snapshot() {
+    const blocks = await page.evaluate(() => {
+      const out = [];
+      const tables = [...document.querySelectorAll('table')];
+      for (const table of tables) {
+        const headers = [...table.querySelectorAll('thead th, tr:first-child th')].map((e) => (e.innerText || '').trim());
+        const trs = [...table.querySelectorAll('tbody tr')];
+        for (const tr of trs) {
+          const cells = [...tr.querySelectorAll('td')].map((e) => (e.innerText || '').trim());
+          if (cells.length) out.push({ headers, cells });
+        }
+      }
+
+      // OutSystems can render responsive tables as role=row/div structures.
+      if (!out.length) {
+        const roleRows = [...document.querySelectorAll('[role="row"]')];
+        let headers = [];
+        for (const row of roleRows) {
+          const cells = [...row.querySelectorAll('[role="columnheader"], [role="cell"], .table-cell, .td')]
+            .map((e) => (e.innerText || '').trim()).filter(Boolean);
+          if (!cells.length) continue;
+          const rowText = cells.join(' | ');
+          if (/hor[aá]rio/i.test(rowText) && /status/i.test(rowText)) headers = cells;
+          else out.push({ headers, cells });
+        }
+      }
+      return out;
+    });
+
+    for (const block of blocks) {
+      const row = mapRow(block.cells, block.headers || []);
+      if (row) collected.set(row.flight, row);
     }
+  }
+
+  // Snapshot first screen, then scroll the visible page/table to capture lazy/virtualized rows.
+  await snapshot();
+  for (let i = 0; i < 18; i++) {
+    const moved = await page.evaluate(() => {
+      let changed = false;
+      const candidates = [...document.querySelectorAll('*')].filter((el) => {
+        const s = getComputedStyle(el);
+        return /(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 40;
+      });
+      for (const el of candidates) {
+        const before = el.scrollTop;
+        el.scrollTop = Math.min(el.scrollTop + Math.max(400, el.clientHeight * 0.85), el.scrollHeight);
+        if (el.scrollTop !== before) changed = true;
+      }
+      const beforeY = window.scrollY;
+      window.scrollBy(0, Math.max(500, window.innerHeight * 0.8));
+      if (window.scrollY !== beforeY) changed = true;
+      return changed;
+    });
+    await page.waitForTimeout(350);
+    await snapshot();
+    if (!moved) break;
+  }
+
+  return [...collected.values()].sort((a, b) => String(a.date_time).localeCompare(String(b.date_time)));
+}
+
+async function readVisiblePanel() {
+  await ensureBrowser();
+  const context = await browser.newContext({
+    locale: 'pt-BR',
+    timezoneId: 'America/Sao_Paulo',
+    serviceWorkers: 'block',
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(PB_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+
+    let flights = await collectRenderedRows(page);
+    if (!flights.length) {
+      // One normal page refresh only. No internal API, cookies, tokens or session reproduction.
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(3500);
+      flights = await collectRenderedRows(page);
+    }
+    if (!flights.length) throw new Error('Nenhum voo visível foi encontrado no painel PB renderizado');
+    return flights;
+  } finally {
+    await context.close();
   }
 }
 
 async function persist(flights) {
-  if (!flights.length) throw new Error('PB API returned zero flights; previous snapshot preserved');
+  if (!flights.length) throw new Error('Zero visible flights; previous snapshot preserved');
   const now = new Date().toISOString();
   const rows = flights.map((f) => ({ ...f, active: true, last_seen_at: now, updated_at: now }));
 
   const { error: upsertError } = await supabase.from('pb_flights').upsert(rows, { onConflict: 'source_key' });
   if (upsertError) throw upsertError;
 
-  const currentKeys = rows.map((r) => r.source_key);
-  const { error: deactivateError } = await supabase
-    .from('pb_flights')
-    .update({ active: false, updated_at: now })
-    .eq('active', true)
-    .not('source_key', 'in', `(${currentKeys.join(',')})`);
-  if (deactivateError) throw deactivateError;
+  // Only deactivate flights not seen in this visible snapshot if we captured a healthy amount.
+  // This protects the last good dataset if the page renders partially for a moment.
+  if (rows.length >= 10) {
+    const keys = rows.map((r) => r.source_key);
+    const { error: deactivateError } = await supabase
+      .from('pb_flights')
+      .update({ active: false, updated_at: now })
+      .eq('active', true)
+      .not('source_key', 'in', `(${keys.join(',')})`);
+    if (deactivateError) throw deactivateError;
+  }
 
   const { error: syncError } = await supabase.from('pb_sync_status').upsert({
     id: 1,
@@ -289,20 +274,19 @@ async function capture() {
   running = true;
   memory.lastAttempt = new Date().toISOString();
   try {
-    const payload = await getPbApiSnapshot();
-    memory.apiResponseSeenAt = new Date().toISOString();
-    const flights = parsePbPayload(payload);
+    const flights = await readVisiblePanel();
     await persist(flights);
     memory = {
       ...memory,
       status: 'live',
+      source: 'PB visible panel only',
       lastSuccess: new Date().toISOString(),
       count: flights.length,
       error: null,
     };
-    console.log(`[PB API] OK: ${flights.length} voos; mode=${memory.mode}`);
+    console.log(`[PB VISIBLE] OK: ${flights.length} voos renderizados`);
   } catch (err) {
-    console.error('[PB API] Error:', err?.message || err);
+    console.error('[PB VISIBLE] Error:', err?.message || err);
     memory = { ...memory, status: memory.lastSuccess ? 'stale' : 'error', error: err?.message || String(err) };
     await setError(err);
   } finally {
@@ -313,19 +297,18 @@ async function capture() {
 
 app.get('/health', (_req, res) => res.json(memory));
 app.post('/refresh', async (_req, res) => res.json(await capture()));
-app.get('/debug/pb', async (_req, res) => {
+app.get('/debug/visible', async (_req, res) => {
   try {
-    const payload = await getPbApiSnapshot();
-    const flights = parsePbPayload(payload);
-    res.json({ count: flights.length, mode: memory.mode, sample: flights.slice(0, 12) });
+    const flights = await readVisiblePanel();
+    res.json({ source: 'PB visible panel only', count: flights.length, sample: flights.slice(0, 15) });
   } catch (e) {
     res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB API Collector v4 :${PORT} polling ${POLL_MS}ms`);
-  console.log('Primary source: direct OutSystems ScreenDataSetGetVoosAeroportoCache POST');
+  console.log(`RIGFLOW PB Visual Collector v5 :${PORT} polling ${POLL_MS}ms`);
+  console.log('Scope: only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 
 await capture();

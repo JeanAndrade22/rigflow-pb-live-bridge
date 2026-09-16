@@ -1,19 +1,21 @@
-# RIGFLOW PB API Collector v4
+# RIGFLOW PB Visual Collector v5
 
-v4 posts directly to the public OutSystems `ScreenDataSetGetVoosAeroportoCache` screen-service endpoint using the request payload captured from the PB flight panel. Playwright remains only as a fallback.
+This version intentionally reads only the flights visibly rendered in the Petrobras flight panel.
 
-Expected successful log:
+It does **not** call internal OutSystems screen-service endpoints directly, copy cookies, reuse browser tokens, or reproduce protected sessions.
 
-`[PB API] OK: <count> voos; mode=direct`
+## What it does
+- Opens the normal PB flight panel in Playwright.
+- Waits for the visible table/list to render.
+- Reads visible rows (including lazy/virtualized rows reached by normal scrolling).
+- Extracts time, airport, destination/route, flight number, company, aircraft model, status and observation when present.
+- Upserts the current visible snapshot into Supabase every 30 seconds while the Render service is awake.
+- Keeps `source_key` stable by flight number so status/time changes update the same flight row.
 
-Endpoints:
-- `/health`
-- `/debug/pb`
-- `POST /refresh`
+## Endpoints
+- `GET /health` collector status
+- `POST /refresh` force one visual refresh
+- `GET /debug/visible` inspect a sample of currently visible rows
 
-Keep the existing Render environment variables:
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- optional `POLL_MS=30000`
-
-If PB changes the OutSystems module/API version, `/health` and logs will say that the payload needs refresh.
+## Important note about Render Free
+Render Free web services can sleep when idle. The 30-second poll only runs while the service is awake. For truly continuous updates, keep the service awake through an approved always-on plan or an approved periodic wake mechanism.
