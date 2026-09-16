@@ -1,38 +1,19 @@
-# RIGFLOW PB API Collector v3
+# RIGFLOW PB API Collector v4
 
-This version no longer scrapes the rendered flight table. It opens the official PB flight panel with Playwright, captures the OutSystems `ScreenDataSetGetVoosAeroporto` XHR response, parses `VoosAeroporto_Cache.XML`, and writes the current snapshot to Supabase.
+v4 posts directly to the public OutSystems `ScreenDataSetGetVoosAeroportoCache` screen-service endpoint using the request payload captured from the PB flight panel. Playwright remains only as a fallback.
 
-## Why this fixes the stale-status problem
+Expected successful log:
 
-The PB response itself contains `NumeroVoo`, `PrefixoAeronave`, `ModeloAeronave`, `Rota`, `StatusVoo`, `HorarioOriginal`, `PrevisaoDecolagem`, `PrevisaoRetorno`, `NomeAeroporto`, `NomeEmpresa`, and `Observacao`.
+`[PB API] OK: <count> voos; mode=direct`
 
-The key is now stable by PB flight number, so if the same flight is moved to tomorrow or changes from `Previsto` to `CheckIn Aberto`, the existing row is updated instead of creating a second stale copy.
+Endpoints:
+- `/health`
+- `/debug/pb`
+- `POST /refresh`
 
-## Render environment variables
-
-Keep the same values already configured:
+Keep the existing Render environment variables:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - optional `POLL_MS=30000`
 
-## Deploy
-
-Replace these files in the existing `rigflow-pb-live-bridge` GitHub repository and commit to `main`:
-- `server.mjs`
-- `package.json`
-- `Dockerfile`
-- `render.yaml`
-
-Render Auto-Deploy should rebuild automatically.
-
-## Test
-
-After deploy, open:
-- `/health`
-- `/debug/pb`
-
-`/debug/pb` should return a fresh count and a sample with live PB statuses.
-
-## Important
-
-The code expects the existing `pb_flights` columns used by the previous collector, including `active`, `last_seen_at`, and `updated_at`.
+If PB changes the OutSystems module/API version, `/health` and logs will say that the payload needs refresh.
