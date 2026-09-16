@@ -1,6 +1,6 @@
 {
-  "name": "rigflow-pb-visual-collector-v7",
-  "version": "7.0.0",
+  "name": "rigflow-pb-visual-collector-v9",
+  "version": "9.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.mjs"

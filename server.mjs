@@ -21,7 +21,7 @@ const app = express();
 let browser;
 let running = false;
 let memory = {
-  version: '8.0.0',
+  version: '9.0.0',
   status: 'starting',
   source: 'PB visible panel only',
   lastAttempt: null,
@@ -383,42 +383,150 @@ async function adaptiveUpsert(table, rows, options = {}) {
   throw new Error(`Could not adapt ${table} payload to schema`);
 }
 
+function eventFromRow(row, seenAt = null) {
+  if (!row) return null;
+  const event = {
+    date_time: clean(row.date_time),
+    status: clean(row.status),
+    airport: clean(row.airport),
+    destination: clean(row.destination),
+    company: clean(row.company),
+    aircraft_model: clean(row.aircraft_model),
+    registration: clean(row.registration),
+    remarks: clean(row.remarks),
+    actual: clean(row.actual),
+    return_forecast: clean(row.return_forecast),
+    seen_at: seenAt || row.last_seen_at || row.first_seen_at || null,
+  };
+  if (!event.date_time && !event.status && !event.actual && !event.remarks) return null;
+  return event;
+}
+
+function eventSignature(e) {
+  return [e.date_time, norm(e.status), e.actual, e.return_forecast, norm(e.remarks), e.registration].join('|');
+}
+
+function parseBrazilSchedule(value) {
+  const m = clean(value).match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return Number.POSITIVE_INFINITY;
+  return Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]), Number(m[6]));
+}
+
+function buildHistory(existingRows, incoming) {
+  const candidates = [];
+  for (const row of existingRows || []) {
+    const oldHistory = Array.isArray(row?.raw?.history) ? row.raw.history : [];
+    for (const e of oldHistory) if (e && typeof e === 'object') candidates.push({ ...e });
+    const ev = eventFromRow(row);
+    if (ev) candidates.push(ev);
+  }
+  const incomingEvent = eventFromRow(incoming, new Date().toISOString());
+  if (incomingEvent) candidates.push(incomingEvent);
+
+  const dedup = new Map();
+  for (const e of candidates) {
+    const sig = eventSignature(e);
+    const prev = dedup.get(sig);
+    if (!prev || String(e.seen_at || '') > String(prev.seen_at || '')) dedup.set(sig, e);
+  }
+  return [...dedup.values()].sort((a, b) => {
+    const da = parseBrazilSchedule(a.date_time);
+    const db = parseBrazilSchedule(b.date_time);
+    if (da !== db) return da - db;
+    return String(a.seen_at || '').localeCompare(String(b.seen_at || ''));
+  });
+}
+
+function chooseRichest(rows) {
+  return [...(rows || [])].sort((a, b) => rowQuality(b) - rowQuality(a))[0] || {};
+}
+
 async function persist(flights) {
   if (!flights.length) throw new Error('Zero visible flights; previous snapshot preserved');
   const now = new Date().toISOString();
 
-  // Fetch current versions so blank/sparse visual rows never erase richer data captured earlier.
-  const keys = flights.map((f) => f.source_key);
-  const existingByKey = new Map();
-  for (let i = 0; i < keys.length; i += 100) {
-    const chunk = keys.slice(i, i + 100);
-    const { data, error } = await supabase.from('pb_flights').select('*').in('source_key', chunk);
+  // Fetch every stored occurrence for each visible flight number. Historical versions used
+  // schedule-dependent source keys, which created duplicate rows after transfers/reprogramming.
+  const flightNumbers = [...new Set(flights.map((f) => clean(f.flight)).filter(Boolean))];
+  const existingByFlight = new Map();
+  for (let i = 0; i < flightNumbers.length; i += 100) {
+    const chunk = flightNumbers.slice(i, i + 100);
+    const { data, error } = await supabase.from('pb_flights').select('*').in('flight', chunk);
     if (error) throw error;
-    for (const row of data || []) existingByKey.set(row.source_key, row);
+    for (const row of data || []) {
+      const key = clean(row.flight);
+      if (!existingByFlight.has(key)) existingByFlight.set(key, []);
+      existingByFlight.get(key).push(row);
+    }
   }
 
-  const rows = flights.map((f) => {
-    const old = existingByKey.get(f.source_key) || {};
-    const merged = { ...old, ...f };
+  const rows = [];
+  const duplicateIdsByFlight = new Map();
+
+  for (const f of flights) {
+    const previous = existingByFlight.get(f.flight) || [];
+    const canonicalKey = stableKey(f.flight);
+    const canonicalOld = previous.find((r) => r.source_key === canonicalKey) || null;
+    const richestOld = chooseRichest(previous);
+    const base = { ...richestOld, ...(canonicalOld || {}) };
+
+    // Prefer the current visible state, but do not let a sparse DOM row erase richer metadata.
+    const merged = { ...base, ...f };
     for (const k of ['date_time','airport','destination','company','aircraft_model','status','remarks','registration','actual','return_forecast']) {
-      if (!clean(f[k]) && clean(old[k])) merged[k] = old[k];
+      if (!clean(f[k]) && clean(base[k])) merged[k] = base[k];
     }
-    merged.active = true;
-    merged.last_seen_at = now;
-    merged.source_key = f.source_key;
+
+    const history = buildHistory(previous, merged);
+    const schedules = history.filter((e) => clean(e.date_time));
+    const original = schedules[0] || null;
+    const currentSchedule = clean(merged.date_time) || (schedules.at(-1)?.date_time || '');
+    const reprogrammed = Boolean(original?.date_time && currentSchedule && original.date_time !== currentSchedule);
+
+    const firstSeenCandidates = previous.map((r) => r.first_seen_at).filter(Boolean).sort();
+    merged.source_key = canonicalKey;
     merged.flight = f.flight;
-    merged.raw = { ...(old.raw || {}), ...(f.raw || {}), captured_at: now };
-    // Do not send DB-generated/id fields back unless required.
+    merged.active = true;
+    merged.first_seen_at = firstSeenCandidates[0] || now;
+    merged.last_seen_at = now;
+    merged.raw = {
+      ...(richestOld.raw || {}),
+      ...(canonicalOld?.raw || {}),
+      ...(f.raw || {}),
+      flight: f.flight,
+      captured_at: now,
+      history,
+      original_schedule: original?.date_time || currentSchedule || '',
+      current_schedule: currentSchedule,
+      reprogrammed,
+      previous_schedules: [...new Set(schedules.map((e) => e.date_time).filter((d) => d && d !== currentSchedule))],
+      logical_flight_key: canonicalKey,
+      source: 'PB visible panel',
+    };
     delete merged.id;
-    return merged;
-  });
+    rows.push(merged);
+
+    const dupIds = previous.filter((r) => r.source_key !== canonicalKey && r.id).map((r) => r.id);
+    if (dupIds.length) duplicateIdsByFlight.set(f.flight, dupIds);
+  }
 
   const result = await adaptiveUpsert('pb_flights', rows, { onConflict: 'source_key' });
   if (result.removed.length) console.warn('[PB VISIBLE] Ignored unavailable pb_flights columns:', result.removed.join(', '));
 
-  // IMPORTANT: visual/virtualized lists can temporarily omit rows. V8 never deactivates a flight
-  // simply because it was absent from one visual scan. This prevents transferred/delayed/cancelled
-  // flights from disappearing from RIGFLOW. Frontend date/status filters decide what is shown.
+  // Consolidate only after the canonical logical-flight row has been written successfully.
+  // History from the old duplicates is already embedded in raw.history before deletion.
+  let removedDuplicates = 0;
+  for (const [flight, ids] of duplicateIdsByFlight) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const { error } = await supabase.from('pb_flights').delete().in('id', chunk);
+      if (error) throw new Error(`Duplicate cleanup failed for flight ${flight}: ${error.message}`);
+      removedDuplicates += chunk.length;
+    }
+  }
+  if (removedDuplicates) console.log(`[PB VISIBLE] Consolidated ${removedDuplicates} duplicate rows into logical flights; history preserved in raw.history`);
+
+  // IMPORTANT: visual/virtualized lists can temporarily omit rows. Never deactivate a flight
+  // simply because it was absent from one visual scan. Date/status filters decide visibility.
 
   const syncPayload = {
     id: 1,
@@ -483,6 +591,7 @@ async function capture() {
   return memory;
 }
 
+app.get('/', (_req, res) => res.json({ service: 'RIGFLOW PB Visual Collector', ...memory, endpoints: ['/health','/debug/visible','/debug/flight/:flight'] }));
 app.get('/health', (_req, res) => res.json(memory));
 app.post('/refresh', async (_req, res) => res.json(await capture()));
 app.get('/debug/visible', async (_req, res) => {
@@ -499,16 +608,26 @@ app.get('/debug/flight/:flight', async (req, res) => {
     const wanted = clean(req.params.flight);
     const flights = await readVisiblePanel();
     const visible = flights.find((f) => f.flight === wanted) || null;
-    const { data: stored, error } = await supabase.from('pb_flights').select('*').eq('flight', wanted).order('last_seen_at', { ascending: false }).limit(5);
+    const { data: stored, error } = await supabase.from('pb_flights').select('*').eq('flight', wanted).order('last_seen_at', { ascending: false }).limit(20);
     if (error) throw error;
-    res.json({ flight: wanted, visible, stored: stored || [] });
+    const logical = (stored || []).find((r) => r.source_key === stableKey(wanted)) || (stored || [])[0] || null;
+    res.json({
+      flight: wanted,
+      visible,
+      logical,
+      timeline: logical?.raw?.history || [],
+      original_schedule: logical?.raw?.original_schedule || null,
+      current_schedule: logical?.raw?.current_schedule || null,
+      reprogrammed: Boolean(logical?.raw?.reprogrammed),
+      stored_rows: stored || [],
+    });
   } catch (e) {
     res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB Visual Collector v8 :${PORT} polling ${POLL_MS}ms`);
+  console.log(`RIGFLOW PB Visual Collector v9 :${PORT} polling ${POLL_MS}ms`);
   console.log('Scope: reads only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 
