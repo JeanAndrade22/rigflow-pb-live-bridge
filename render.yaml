@@ -1,10 +1,13 @@
 services:
   - type: web
-    name: rigflow-pb-collector
+    name: rigflow-pb-live-bridge
     runtime: docker
-    plan: starter
+    plan: free
+    autoDeploy: true
     healthCheckPath: /health
     envVars:
+      - key: PORT
+        value: 8787
       - key: POLL_MS
         value: 30000
       - key: SUPABASE_URL

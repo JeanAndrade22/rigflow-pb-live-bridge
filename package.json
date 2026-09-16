@@ -1,8 +1,14 @@
 {
-  "name":"rigflow-pb-collector",
-  "version":"2.0.0",
-  "private":true,
-  "type":"module",
-  "scripts":{"start":"node server.mjs"},
-  "dependencies":{"@supabase/supabase-js":"^2.57.4","express":"^4.21.2","playwright":"^1.55.0"}
+  "name": "rigflow-pb-collector",
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "express": "^5.1.0",
+    "fast-xml-parser": "^5.2.5",
+    "playwright": "^1.63.0"
+  }
 }
