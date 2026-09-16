@@ -21,7 +21,7 @@ const app = express();
 let browser;
 let running = false;
 let memory = {
-  version: '6.0.0',
+  version: '7.0.0',
   status: 'starting',
   source: 'PB visible panel only',
   lastAttempt: null,
@@ -161,66 +161,134 @@ async function collectRenderedRows(page) {
   }, { timeout: 45000 }).catch(() => {});
 
   const collected = new Map();
+  let blockNo = 0;
+  let noGrowthRounds = 0;
 
-  async function snapshot() {
+  async function snapshot(label = '') {
     const blocks = await page.evaluate(() => {
       const out = [];
-      const tables = [...document.querySelectorAll('table')];
-      for (const table of tables) {
-        const headers = [...table.querySelectorAll('thead th, tr:first-child th')].map((e) => (e.innerText || '').trim());
-        const trs = [...table.querySelectorAll('tbody tr')];
-        for (const tr of trs) {
-          const cells = [...tr.querySelectorAll('td')].map((e) => (e.innerText || '').trim());
-          if (cells.length) out.push({ headers, cells });
+      const seen = new Set();
+      const pushRow = (headers, cells) => {
+        const cleaned = cells.map((v) => (v || '').trim());
+        if (!cleaned.length) return;
+        const sig = cleaned.join(' | ');
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        out.push({ headers, cells: cleaned });
+      };
+
+      for (const table of [...document.querySelectorAll('table')]) {
+        const headers = [...table.querySelectorAll('thead th, tr:first-child th')]
+          .map((e) => (e.innerText || '').trim());
+        for (const tr of [...table.querySelectorAll('tbody tr')]) {
+          pushRow(headers, [...tr.querySelectorAll('td')].map((e) => e.innerText || ''));
         }
       }
 
+      // OutSystems / virtualized grid fallback.
+      for (const grid of [...document.querySelectorAll('[role="grid"], [role="table"], .table, .osui-table')]) {
+        let headers = [...grid.querySelectorAll('[role="columnheader"], thead th')]
+          .map((e) => (e.innerText || '').trim()).filter(Boolean);
+        for (const row of [...grid.querySelectorAll('[role="row"], tbody tr')]) {
+          const cells = [...row.querySelectorAll('[role="cell"], td, .table-cell, .td')]
+            .map((e) => (e.innerText || '').trim()).filter(Boolean);
+          if (cells.length) pushRow(headers, cells);
+        }
+      }
+
+      // Generic row fallback for OutSystems layouts that do not expose table semantics.
       if (!out.length) {
-        const roleRows = [...document.querySelectorAll('[role="row"]')];
-        let headers = [];
-        for (const row of roleRows) {
-          const headerCells = [...row.querySelectorAll('[role="columnheader"]')]
-            .map((e) => (e.innerText || '').trim()).filter(Boolean);
-          if (headerCells.length) {
-            headers = headerCells;
-            continue;
-          }
-          const cells = [...row.querySelectorAll('[role="cell"], .table-cell, .td')]
-            .map((e) => (e.innerText || '').trim()).filter(Boolean);
-          if (cells.length) out.push({ headers, cells });
+        const nodes = [...document.querySelectorAll('div, li')];
+        for (const el of nodes) {
+          const txt = (el.innerText || '').trim();
+          if (!/\b\d{7,12}\b/.test(txt)) continue;
+          const children = [...el.children].map((c) => (c.innerText || '').trim()).filter(Boolean);
+          if (children.length >= 4 && children.length <= 16) pushRow([], children);
         }
       }
       return out;
     });
 
+    const before = collected.size;
     for (const block of blocks) {
       const row = mapRow(block.cells, block.headers || []);
       if (row) collected.set(row.flight, row);
     }
+    const added = collected.size - before;
+    blockNo += 1;
+    console.log(`[PB VISIBLE] scan ${blockNo}${label ? ` ${label}` : ''}: ${blocks.length} linhas, +${added} novos, total ${collected.size}`);
+    return added;
   }
 
-  await snapshot();
-  for (let i = 0; i < 24; i++) {
-    const moved = await page.evaluate(() => {
-      let changed = false;
-      const candidates = [...document.querySelectorAll('*')].filter((el) => {
+  async function findBestScroller() {
+    return await page.evaluate(() => {
+      const all = [...document.querySelectorAll('*')];
+      const candidates = all.map((el, idx) => {
         const s = getComputedStyle(el);
-        return /(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 40;
-      });
-      for (const el of candidates) {
-        const before = el.scrollTop;
-        el.scrollTop = Math.min(el.scrollTop + Math.max(450, el.clientHeight * 0.9), el.scrollHeight);
-        if (el.scrollTop !== before) changed = true;
-      }
-      const beforeY = window.scrollY;
-      window.scrollBy(0, Math.max(600, window.innerHeight * 0.9));
-      if (window.scrollY !== beforeY) changed = true;
-      return changed;
+        const scrollable = /(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 80;
+        if (!scrollable) return null;
+        const text = (el.innerText || '').slice(0, 20000);
+        const flightHits = (text.match(/\b\d{7,12}\b/g) || []).length;
+        const tableish = el.querySelectorAll('table, [role="row"], tbody tr, .table-row').length;
+        const score = flightHits * 5 + tableish * 2 + Math.min(20, Math.round(el.scrollHeight / Math.max(1, el.clientHeight)));
+        return { idx, score, flightHits, tableish, h: el.scrollHeight, ch: el.clientHeight };
+      }).filter(Boolean).sort((a,b) => b.score - a.score);
+      if (!candidates.length) return null;
+      const best = candidates[0];
+      const el = all[best.idx];
+      el.setAttribute('data-rigflow-scroller', '1');
+      return best;
     });
-    await page.waitForTimeout(300);
-    await snapshot();
-    if (!moved) break;
   }
+
+  await snapshot('initial');
+  const scroller = await findBestScroller();
+  if (scroller) console.log(`[PB VISIBLE] scroller detected: flights=${scroller.flightHits}, rows=${scroller.tableish}, height=${scroller.h}`);
+  else console.log('[PB VISIBLE] no dedicated scroll container detected; using page scroll');
+
+  // Reset to top before a complete pass.
+  await page.evaluate(() => {
+    const el = document.querySelector('[data-rigflow-scroller="1"]');
+    if (el) el.scrollTop = 0;
+    window.scrollTo(0, 0);
+  });
+  await page.waitForTimeout(500);
+  await snapshot('top');
+
+  // Walk the virtualized list until repeated scans stop discovering new flights.
+  for (let i = 0; i < 80; i++) {
+    const state = await page.evaluate(() => {
+      const el = document.querySelector('[data-rigflow-scroller="1"]');
+      if (el) {
+        const before = el.scrollTop;
+        const step = Math.max(220, Math.floor(el.clientHeight * 0.72));
+        el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight - el.clientHeight);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+        return { moved: el.scrollTop !== before, atEnd: el.scrollTop + el.clientHeight >= el.scrollHeight - 4, top: el.scrollTop, max: el.scrollHeight - el.clientHeight };
+      }
+      const before = window.scrollY;
+      window.scrollBy(0, Math.max(350, Math.floor(window.innerHeight * 0.72)));
+      return { moved: window.scrollY !== before, atEnd: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4, top: window.scrollY, max: document.documentElement.scrollHeight - window.innerHeight };
+    });
+
+    // Give OutSystems/virtual list time to recycle/render rows.
+    await page.waitForTimeout(650);
+    const added = await snapshot(`step=${i + 1}`);
+    noGrowthRounds = added === 0 ? noGrowthRounds + 1 : 0;
+
+    if (state.atEnd && noGrowthRounds >= 2) break;
+    if (!state.moved && noGrowthRounds >= 2) break;
+    if (noGrowthRounds >= 8) {
+      // Some virtual lists report a huge/elastic scroll range; stop after repeated no-growth.
+      console.log('[PB VISIBLE] stopping after repeated scans with no new flights');
+      break;
+    }
+  }
+
+  // Final bottom snapshot after a slightly longer wait for lazy rendering.
+  await page.waitForTimeout(1200);
+  await snapshot('final');
+  console.log(`[PB VISIBLE] TOTAL: ${collected.size} voos únicos renderizados`);
 
   return [...collected.values()].sort((a, b) => String(a.date_time).localeCompare(String(b.date_time)));
 }
@@ -388,7 +456,7 @@ app.get('/debug/visible', async (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB Visual Collector v6 :${PORT} polling ${POLL_MS}ms`);
+  console.log(`RIGFLOW PB Visual Collector v7 :${PORT} polling ${POLL_MS}ms`);
   console.log('Scope: reads only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 
