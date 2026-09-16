@@ -1,21 +1,32 @@
-# RIGFLOW PB Visual Collector v5
+# RIGFLOW PB Visual Collector v9
 
-This version intentionally reads only the flights visibly rendered in the Petrobras flight panel.
+This version keeps the visual-only collection approach and fixes logical-flight consolidation.
 
-It does **not** call internal OutSystems screen-service endpoints directly, copy cookies, reuse browser tokens, or reproduce protected sessions.
+## What V9 changes
+- One canonical `pb_flights` row per flight number (`source_key = SHA256("PB|<flight>")`).
+- Existing duplicate rows for a visible flight are merged only after the canonical row is successfully written.
+- Historical schedule/status snapshots are preserved in `raw.history` before duplicates are deleted.
+- `raw.original_schedule`, `raw.current_schedule`, `raw.reprogrammed`, and `raw.previous_schedules` support transferred/reprogrammed flights.
+- Sparse DOM captures never erase richer stored values.
+- Missing rows in a visual scan are not automatically deactivated.
+- `/debug/flight/:flight` returns the logical row plus timeline and schedule history.
+- `/` now returns service status instead of `Cannot GET /`.
 
-## What it does
-- Opens the normal PB flight panel in Playwright.
-- Waits for the visible table/list to render.
-- Reads visible rows (including lazy/virtualized rows reached by normal scrolling).
-- Extracts time, airport, destination/route, flight number, company, aircraft model, status and observation when present.
-- Upserts the current visible snapshot into Supabase every 30 seconds while the Render service is awake.
-- Keeps `source_key` stable by flight number so status/time changes update the same flight row.
+## Safety scope
+Reads only flight data rendered in the normal PB panel. No internal API, copied session, cookie, token, or authentication bypass.
 
-## Endpoints
-- `GET /health` collector status
-- `POST /refresh` force one visual refresh
-- `GET /debug/visible` inspect a sample of currently visible rows
+## Verification performed before packaging
+- `node --check server.mjs` passed.
+- A regression fixture for flight `509571378` verified consolidation of `16/09 10:33`, `16/09 13:33`, and reprogrammed `17/09 06:48`, preserving `10:33` as the original schedule.
+- Package contents and ZIP integrity were checked.
 
-## Important note about Render Free
-Render Free web services can sleep when idle. The 30-second poll only runs while the service is awake. For truly continuous updates, keep the service awake through an approved always-on plan or an approved periodic wake mechanism.
+## After deploy
+Open:
+`https://<render-host>/debug/flight/509571378`
+
+Expected after the first successful sync:
+- one canonical logical row for the flight,
+- `original_schedule: 16/09/2026 10:33:00`,
+- `current_schedule: 17/09/2026 06:48:00` (if still shown by PB),
+- `reprogrammed: true`,
+- timeline/history containing the preserved schedule snapshots.
