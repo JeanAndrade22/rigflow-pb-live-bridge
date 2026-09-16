@@ -1,35 +1,14 @@
-# RIGFLOW PB Visual Collector v10
+# RIGFLOW PB Visual Collector v11
 
-This version keeps the visual-only collection approach and fixes logical-flight consolidation.
+V11 keeps the visual-only PB collection approach and fixes operator/registration recovery from virtualized DOM layouts.
 
-## What V10 changes
-- One canonical `pb_flights` row per flight number (`source_key = SHA256("PB|<flight>")`).
-- Existing duplicate rows for a visible flight are merged only after the canonical row is successfully written.
-- Historical schedule/status snapshots are preserved in `raw.history` before duplicates are deleted.
-- `raw.original_schedule`, `raw.current_schedule`, `raw.reprogrammed`, and `raw.previous_schedules` support transferred/reprogrammed flights.
-- Sparse DOM captures never erase richer stored values.
-- Missing rows in a visual scan are not automatically deactivated.
-- `/debug/flight/:flight` returns the logical row plus timeline and schedule history.
-- `/` now returns service status instead of `Cannot GET /`.
+## Changes
+- Adds flight-centric DOM context capture around each visible flight number.
+- Recovers company/operator, aircraft model and registration from compact ancestors and neighboring DOM nodes when the table splits those fields.
+- Never fabricates a company from an aircraft model. If no operator is actually present in the visible DOM context, company stays blank so a richer stored value can survive.
+- Keeps V9/V10 logical-flight consolidation, reprogramming history and canonical source keys.
+- Adds `/debug/dom/:flight` to show exactly what the browser can see around one flight, making the parser verifiable instead of guess-based.
+- `/debug/flight/:flight` continues to expose logical row, timeline and schedules.
 
 ## Safety scope
-Reads only flight data rendered in the normal PB panel. No internal API, copied session, cookie, token, or authentication bypass.
-
-## Verification performed before packaging
-- `node --check server.mjs` passed.
-- A regression fixture for flight `509571378` verified consolidation of `16/09 10:33`, `16/09 13:33`, and reprogrammed `17/09 06:48`, preserving `10:33` as the original schedule.
-- Package contents and ZIP integrity were checked.
-
-## After deploy
-Open:
-`https://<render-host>/debug/flight/509571378`
-
-Expected after the first successful sync:
-- one canonical logical row for the flight,
-- `original_schedule: 16/09/2026 10:33:00`,
-- `current_schedule: 17/09/2026 06:48:00` (if still shown by PB),
-- `reprogrammed: true`,
-- timeline/history containing the preserved schedule snapshots.
-
-
-V10: corrected company/operator vs aircraft-model mapping for generic/virtualized PB rows. Model-shaped values such as H175/AW139/S-92A are never allowed to overwrite company. Existing richer company values are preserved.
+Reads only data rendered by the normal PB flight panel. No internal API, copied session, cookie, token, or authentication bypass.

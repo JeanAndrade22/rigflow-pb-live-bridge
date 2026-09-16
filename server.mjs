@@ -21,7 +21,7 @@ const app = express();
 let browser;
 let running = false;
 let memory = {
-  version: '10.0.0',
+  version: '11.0.0',
   status: 'starting',
   source: 'PB visible panel only',
   lastAttempt: null,
@@ -135,7 +135,52 @@ function normalizeIdentityFields(row, cells = []) {
   return { ...row, company, aircraft_model: model, registration, status };
 }
 
-function mapRow(cells, headers) {
+
+function splitContextTokens(text = '') {
+  const raw = String(text ?? '').replace(/\r/g, '\n');
+  const parts = raw
+    .split(/\n+|\s{2,}|\s*[|•·]+\s*/)
+    .map(clean)
+    .filter(Boolean);
+  return [...new Set(parts)].slice(0, 120);
+}
+
+function enrichIdentityFromContexts(row, contexts = []) {
+  const contextTokens = contexts.flatMap((c) => splitContextTokens(c));
+  const combined = [...contextTokens];
+  let out = normalizeIdentityFields({ ...row }, combined);
+
+  if (!out.registration) {
+    const reg = combined.find(looksLikeRegistration);
+    if (reg) out.registration = clean(reg).toUpperCase();
+  }
+  if (!out.aircraft_model) {
+    const model = combined.find(looksLikeAircraftModel);
+    if (model) out.aircraft_model = clean(model).toUpperCase();
+  }
+  if (!out.company) {
+    out.company = inferCompany(combined, out.aircraft_model, out.registration, out.status);
+  }
+
+  // Never manufacture an operator from a model. If the context does not contain a real operator,
+  // leave company blank so a richer stored value can survive the merge.
+  if (looksLikeAircraftModel(out.company) || looksLikeRegistration(out.company) || looksLikeStatus(out.company)) {
+    out.company = '';
+  }
+
+  out.raw = {
+    ...(out.raw || {}),
+    flight: out.flight,
+    company: out.company,
+    aircraft_model: out.aircraft_model,
+    registration: out.registration,
+    status: out.status,
+    dom_context_sample: contextTokens.slice(0, 40),
+  };
+  return out;
+}
+
+function mapRow(cells, headers, contexts = []) {
   if (!Array.isArray(cells) || cells.length < 4) return null;
   const hs = headers.map(norm);
 
@@ -195,6 +240,7 @@ function mapRow(cells, headers) {
   };
 
   row = normalizeIdentityFields(row, cells);
+  row = enrichIdentityFromContexts(row, contexts);
 
   row.raw = {
     flight: row.flight,
@@ -279,20 +325,20 @@ async function collectRenderedRows(page) {
     const blocks = await page.evaluate(() => {
       const out = [];
       const seen = new Set();
-      const pushRow = (headers, cells) => {
+      const pushRow = (headers, cells, contexts = []) => {
         const cleaned = cells.map((v) => (v || '').trim());
         if (!cleaned.length) return;
         const sig = cleaned.join(' | ');
         if (seen.has(sig)) return;
         seen.add(sig);
-        out.push({ headers, cells: cleaned });
+        out.push({ headers, cells: cleaned, contexts: [...new Set((contexts || []).map((x) => (x || '').trim()).filter(Boolean))].slice(0, 40) });
       };
 
       for (const table of [...document.querySelectorAll('table')]) {
         const headers = [...table.querySelectorAll('thead th, tr:first-child th')]
           .map((e) => (e.innerText || '').trim());
         for (const tr of [...table.querySelectorAll('tbody tr')]) {
-          pushRow(headers, [...tr.querySelectorAll('td')].map((e) => e.innerText || ''));
+          pushRow(headers, [...tr.querySelectorAll('td')].map((e) => e.innerText || ''), [tr.innerText || '']);
         }
       }
 
@@ -303,7 +349,7 @@ async function collectRenderedRows(page) {
         for (const row of [...grid.querySelectorAll('[role="row"], tbody tr')]) {
           const cells = [...row.querySelectorAll('[role="cell"], td, .table-cell, .td')]
             .map((e) => (e.innerText || '').trim()).filter(Boolean);
-          if (cells.length) pushRow(headers, cells);
+          if (cells.length) pushRow(headers, cells, [row.innerText || '']);
         }
       }
 
@@ -315,14 +361,52 @@ async function collectRenderedRows(page) {
         if (!/\b\d{7,12}\b/.test(txt)) continue;
         if (txt.length > 1800) continue;
         const children = [...el.children].map((c) => (c.innerText || '').trim()).filter(Boolean);
-        if (children.length >= 4 && children.length <= 20) pushRow([], children);
+        if (children.length >= 4 && children.length <= 20) {
+          const contexts = [txt];
+          let cur = el;
+          for (let depth = 0; depth < 5 && cur; depth++, cur = cur.parentElement) {
+            const t = (cur.innerText || '').trim();
+            if (t && t.length <= 1400 && /\b\d{7,12}\b/.test(t)) contexts.push(t);
+            const prev = cur.previousElementSibling;
+            const next = cur.nextElementSibling;
+            for (const sib of [prev, next]) {
+              const st = (sib?.innerText || '').trim();
+              if (st && st.length <= 700) contexts.push(st);
+            }
+          }
+          pushRow([], children, contexts);
+        }
+      }
+      // Flight-centric context extractor: captures compact ancestors and nearby siblings around each
+      // visible flight number. This is diagnostic and also helps recover company/registration when a
+      // virtualized grid splits those fields across neighboring DOM nodes.
+      const flightNodes = [...document.querySelectorAll('body *')].filter((el) => {
+        const own = [...el.childNodes].filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent || '').join(' ');
+        return /\b\d{7,12}\b/.test(own);
+      });
+      for (const el of flightNodes) {
+        const own = (el.innerText || '').trim();
+        const m = own.match(/\b\d{7,12}\b/);
+        if (!m) continue;
+        const contexts = [own];
+        let cur = el;
+        for (let depth = 0; depth < 7 && cur; depth++, cur = cur.parentElement) {
+          const t = (cur.innerText || '').trim();
+          if (t && t.length <= 1600 && t.includes(m[0])) contexts.push(t);
+          const siblings = [cur.previousElementSibling, cur.nextElementSibling];
+          for (const sib of siblings) {
+            const st = (sib?.innerText || '').trim();
+            if (st && st.length <= 800) contexts.push(st);
+          }
+        }
+        pushRow([], [m[0], ...contexts.flatMap((t) => t.split(/\n+/)).map((x) => x.trim()).filter(Boolean).slice(0, 18)], contexts);
       }
       return out;
     });
 
     const before = collected.size;
     for (const block of blocks) {
-      const row = mapRow(block.cells, block.headers || []);
+      const row = mapRow(block.cells, block.headers || [], block.contexts || []);
       if (row) collected.set(row.flight, mergeRow(collected.get(row.flight), row));
     }
     const added = collected.size - before;
@@ -665,7 +749,7 @@ async function capture() {
   return memory;
 }
 
-app.get('/', (_req, res) => res.json({ service: 'RIGFLOW PB Visual Collector', ...memory, endpoints: ['/health','/debug/visible','/debug/flight/:flight'] }));
+app.get('/', (_req, res) => res.json({ service: 'RIGFLOW PB Visual Collector', ...memory, endpoints: ['/health','/debug/visible','/debug/flight/:flight','/debug/dom/:flight'] }));
 app.get('/health', (_req, res) => res.json(memory));
 app.post('/refresh', async (_req, res) => res.json(await capture()));
 app.get('/debug/visible', async (_req, res) => {
@@ -700,8 +784,54 @@ app.get('/debug/flight/:flight', async (req, res) => {
   }
 });
 
+
+app.get('/debug/dom/:flight', async (req, res) => {
+  let context;
+  try {
+    const wanted = clean(req.params.flight);
+    await ensureBrowser();
+    context = await browser.newContext({
+      locale: 'pt-BR',
+      timezoneId: 'America/Sao_Paulo',
+      serviceWorkers: 'block',
+    });
+    const page = await context.newPage();
+    await page.goto(PB_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+    const result = await page.evaluate((flight) => {
+      const items = [];
+      const seen = new Set();
+      const all = [...document.querySelectorAll('body *')];
+      for (const el of all) {
+        const text = (el.innerText || '').trim();
+        if (!text.includes(flight) || text.length > 1800) continue;
+        const ownText = [...el.childNodes].filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => (n.textContent || '').trim()).filter(Boolean).join(' ');
+        const siblings = [el.previousElementSibling, el.nextElementSibling]
+          .map((sib) => (sib?.innerText || '').trim()).filter((x) => x && x.length <= 900);
+        const key = `${el.tagName}|${text}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({
+          tag: el.tagName,
+          className: typeof el.className === 'string' ? el.className : '',
+          ownText,
+          text,
+          siblings,
+        });
+      }
+      return items.sort((a, b) => a.text.length - b.text.length).slice(0, 30);
+    }, wanted);
+    res.json({ flight: wanted, contexts: result });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  } finally {
+    try { await context?.close(); } catch {}
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`RIGFLOW PB Visual Collector v10 :${PORT} polling ${POLL_MS}ms`);
+  console.log(`RIGFLOW PB Visual Collector v11 :${PORT} polling ${POLL_MS}ms`);
   console.log('Scope: reads only flights rendered in the PB panel. No internal API/session/token reproduction.');
 });
 
